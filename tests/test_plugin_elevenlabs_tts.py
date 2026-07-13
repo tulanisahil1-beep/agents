@@ -4,13 +4,43 @@ import asyncio
 import base64
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
+from livekit.agents import APIConnectionError, APIConnectOptions, APIStatusError
 from livekit.plugins.elevenlabs import tts as elevenlabs_tts
+from livekit.plugins.elevenlabs._utils import get_trace_id
 
 pytestmark = pytest.mark.plugin("elevenlabs")
+
+
+def _response_headers(**items: str) -> CIMultiDictProxy[str]:
+    return CIMultiDictProxy(CIMultiDict(items))
+
+
+def _client_response_error(
+    *,
+    status: int = 403,
+    message: str = "Invalid response status",
+    headers: CIMultiDictProxy[str] | None = None,
+) -> aiohttp.WSServerHandshakeError:
+    request_info = aiohttp.RequestInfo(
+        url=URL("wss://api.elevenlabs.io/v1/text-to-speech/voice/multi-stream-input"),
+        method="GET",
+        headers=CIMultiDictProxy(CIMultiDict()),
+        real_url=URL("wss://api.elevenlabs.io/v1/text-to-speech/voice/multi-stream-input"),
+    )
+    return aiohttp.WSServerHandshakeError(
+        request_info,
+        (),
+        status=status,
+        message=message,
+        headers=headers,
+    )
 
 
 class _FakeWebSocket:
@@ -78,6 +108,16 @@ def _websocket_text_message(payload: dict[str, object]) -> object:
     return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(payload))
 
 
+def test_get_trace_id_returns_header_value() -> None:
+    assert get_trace_id(_response_headers(**{"x-trace-id": "trace-123"})) == "trace-123"
+
+
+def test_get_trace_id_returns_none_when_missing_or_empty() -> None:
+    assert get_trace_id(None) is None
+    assert get_trace_id(_response_headers()) is None
+    assert get_trace_id(_response_headers(**{"x-trace-id": ""})) is None
+
+
 def test_auto_mode_defaults_to_true_without_chunk_length_schedule() -> None:
     tts = elevenlabs_tts.TTS(api_key="test-key")
     assert tts._opts.auto_mode is True
@@ -137,6 +177,151 @@ def test_build_context_init_packet_includes_pronunciation_dictionaries() -> None
             "version_id": "v1",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_connect_attaches_x_trace_id_on_handshake_failure() -> None:
+    tts = elevenlabs_tts.TTS(api_key="secret-api-key")
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(
+        side_effect=_client_response_error(
+            headers=_response_headers(
+                **{"x-trace-id": "el-trace-xyz", "xi-api-key": "secret-api-key"}
+            )
+        )
+    )
+    connection = elevenlabs_tts._Connection(tts._opts, session)
+
+    with pytest.raises(APIStatusError) as exc_info:
+        await connection.connect()
+
+    err = exc_info.value
+    assert err.status_code == 403
+    assert err.request_id == "el-trace-xyz"
+    assert err.body is None
+    assert "secret-api-key" not in str(err)
+    assert "xi-api-key" not in str(err)
+    assert "request_id=el-trace-xyz" in str(err)
+
+
+@pytest.mark.asyncio
+async def test_connect_omits_request_id_when_x_trace_id_missing() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key")
+    session = AsyncMock()
+    session.ws_connect = AsyncMock(side_effect=_client_response_error(headers=_response_headers()))
+    connection = elevenlabs_tts._Connection(tts._opts, session)
+
+    with pytest.raises(APIStatusError) as exc_info:
+        await connection.connect()
+
+    err = exc_info.value
+    assert err.request_id is None
+    assert "request_id=" not in str(err)
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_preserves_trace_id_through_connect_wrapping() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key")
+    stream = elevenlabs_tts.SynthesizeStream(
+        tts=tts, conn_options=APIConnectOptions(max_retry=0, timeout=1.0)
+    )
+    traced = APIStatusError(
+        "Invalid response status",
+        status_code=403,
+        request_id="el-trace-preserved",
+        body=None,
+    )
+
+    async def _failing_connection() -> tuple[object, float, bool]:
+        raise traced
+
+    tts._current_connection = _failing_connection  # type: ignore[method-assign]
+
+    emitter = SimpleNamespace(
+        initialize=lambda **_kwargs: None,
+        start_segment=lambda **_kwargs: None,
+        end_segment=lambda: None,
+    )
+
+    try:
+        with pytest.raises(APIStatusError) as exc_info:
+            await stream._run(emitter)  # type: ignore[arg-type]
+
+        assert exc_info.value is traced
+        assert exc_info.value.request_id == "el-trace-preserved"
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_wraps_non_status_connect_errors() -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key")
+    stream = elevenlabs_tts.SynthesizeStream(
+        tts=tts, conn_options=APIConnectOptions(max_retry=0, timeout=1.0)
+    )
+
+    async def _failing_connection() -> tuple[object, float, bool]:
+        raise RuntimeError("dns failed")
+
+    tts._current_connection = _failing_connection  # type: ignore[method-assign]
+
+    emitter = SimpleNamespace(
+        initialize=lambda **_kwargs: None,
+        start_segment=lambda **_kwargs: None,
+        end_segment=lambda: None,
+    )
+
+    try:
+        with pytest.raises(APIConnectionError, match="could not connect to ElevenLabs"):
+            await stream._run(emitter)  # type: ignore[arg-type]
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chunked_stream_attaches_x_trace_id_on_http_failure() -> None:
+    tts = elevenlabs_tts.TTS(api_key="secret-api-key")
+    stream = elevenlabs_tts.ChunkedStream(
+        tts=tts,
+        input_text="hello",
+        conn_options=APIConnectOptions(max_retry=0, timeout=1.0),
+    )
+    error = aiohttp.ClientResponseError(
+        aiohttp.RequestInfo(
+            url=URL("https://api.elevenlabs.io/v1/text-to-speech/voice"),
+            method="POST",
+            headers=CIMultiDictProxy(CIMultiDict()),
+            real_url=URL("https://api.elevenlabs.io/v1/text-to-speech/voice"),
+        ),
+        (),
+        status=429,
+        message="Too Many Requests",
+        headers=_response_headers(**{"x-trace-id": "http-trace-1"}),
+    )
+
+    class _FailingSession:
+        def post(self, *_args: object, **_kwargs: object) -> object:
+            raise error
+
+    tts._ensure_session = lambda: _FailingSession()  # type: ignore[method-assign]
+
+    emitter = SimpleNamespace(
+        initialize=lambda **_kwargs: None,
+        push=lambda *_args: None,
+        flush=lambda: None,
+    )
+
+    try:
+        with pytest.raises(APIStatusError) as exc_info:
+            await stream._run(emitter)  # type: ignore[arg-type]
+
+        err = exc_info.value
+        assert err.request_id == "http-trace-1"
+        assert err.status_code == 429
+        assert err.body is None
+        assert "secret-api-key" not in str(err)
+    finally:
+        await stream.aclose()
 
 
 @pytest.mark.asyncio

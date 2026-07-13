@@ -44,6 +44,7 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, NotGive
 from livekit.agents.utils import is_given
 from livekit.agents.voice.io import TimedString
 
+from ._utils import get_trace_id
 from .log import logger
 from .models import TTSEncoding, TTSModels
 
@@ -383,7 +384,7 @@ class ChunkedStream(tts.ChunkedStream):
             raise APIStatusError(
                 message=e.message,
                 status_code=e.status,
-                request_id=None,
+                request_id=get_trace_id(e.headers),
                 body=None,
             ) from e
         except Exception as e:
@@ -434,6 +435,8 @@ class SynthesizeStream(tts.SynthesizeStream):
             )
         except asyncio.TimeoutError as e:
             raise APITimeoutError() from e
+        except APIStatusError:
+            raise
         except Exception as e:
             raise APIConnectionError("could not connect to ElevenLabs") from e
 
@@ -636,7 +639,15 @@ class _Connection:
 
         url = _multi_stream_url(self._opts)
         headers = {AUTHORIZATION_HEADER: self._opts.api_key}
-        self._ws = await self._session.ws_connect(url, headers=headers)
+        try:
+            self._ws = await self._session.ws_connect(url, headers=headers)
+        except aiohttp.ClientResponseError as e:
+            raise APIStatusError(
+                message=e.message,
+                status_code=e.status,
+                request_id=get_trace_id(e.headers),
+                body=None,
+            ) from e
 
         self._send_task = asyncio.create_task(self._send_loop())
         self._recv_task = asyncio.create_task(self._recv_loop())

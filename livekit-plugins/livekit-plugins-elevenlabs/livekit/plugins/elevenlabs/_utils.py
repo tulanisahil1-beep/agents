@@ -1,8 +1,22 @@
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Generic, TypeVar
 
 T = TypeVar("T")
+
+
+def get_trace_id(headers: Mapping[str, str] | None) -> str | None:
+    """Return ElevenLabs ``x-trace-id`` from response headers, if present.
+
+    Missing or empty values return ``None`` so callers do not attach a misleading
+    empty trace id to errors.
+    """
+    if not headers:
+        return None
+    trace_id = headers.get("x-trace-id")
+    if not trace_id:
+        return None
+    return trace_id
 
 
 class PeriodicCollector(Generic[T]):
